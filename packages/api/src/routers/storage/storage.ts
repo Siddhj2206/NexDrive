@@ -1,23 +1,33 @@
 import { z } from "zod";
 import { S3Client } from "bun";
+import { TRPCError } from "@trpc/server";
+import {
+  Asset,
+  DEFAULT_RATE_LIMIT,
+  File,
+  Folder,
+  MAX_FILE_SIZE,
+  RATE_LIMIT_WINDOW_MS,
+  RateLimitWindow,
+  adjustStorageUsed,
+  ensureQuota,
+  getQuota as readQuota,
+  idString,
+  toObjectId,
+  withTransaction,
+} from "@nexdrive/db";
 import { router, protectedProcedure, publicProcedure } from "../../index";
 import { getEnv } from "../../env";
-import { db } from "@Vinnodrive/db";
-import {
-  files,
-  userAssets,
-  folders,
-  userQuotas,
-  rateLimitWindows,
-} from "@Vinnodrive/db/schema/storage";
-import { eq, sql, and, desc, isNull, isNotNull, count } from "drizzle-orm";
-import { TRPCError } from "@trpc/server";
+
+// A converted ObjectId, as returned by `toObjectId`.
+type Oid = ReturnType<typeof toObjectId>;
+// The transaction session passed to `withTransaction` callbacks.
+type Session = Parameters<Parameters<typeof withTransaction>[0]>[0];
 
 // Get validated environment
 const env = getEnv();
 
-// Cloudflare R2 Client configuration (S3-compatible)
-// Endpoint format: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+// S3 Client configuration
 const s3 = new S3Client({
   accessKeyId: env.R2_ACCESS_KEY_ID,
   secretAccessKey: env.R2_SECRET_ACCESS_KEY,
@@ -26,11 +36,12 @@ const s3 = new S3Client({
   region: "auto", // R2 uses "auto" for region
 });
 
-// Default configuration (configurable)
-const DEFAULT_STORAGE_LIMIT = 1 * 1024 * 1024 * 1024; // 1GB
-const DEFAULT_RATE_LIMIT = 2; // 2 API calls per second
-const RATE_LIMIT_WINDOW_MS = 1000; // 1 second window
-const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10GB max file size
+/**
+ * ObjectId input. Ids cross the wire as 24-character hex strings; MongoDB will
+ * not match a string against an ObjectId, so every id is converted before use.
+ */const objectIdSchema = z
+  .string()
+  .regex(/^[a-f0-9]{24}$/i, "Invalid id");
 
 // Validation schemas
 /**
@@ -44,18 +55,14 @@ const filenameSchema = z
   .string()
   .min(1, "Filename is required")
   .max(255, "Filename must be 255 characters or less")
-  .regex(
-    /^[^\/\\:\*\?"<>\|\x00]+$/,
-    "Filename contains invalid characters"
-  )
+  .regex(/^[^\/\\:\*\?"<>\|\x00]+$/, "Filename contains invalid characters")
   .refine(
     (name) => !name.includes(".."),
-    "Filename cannot contain path traversal sequences"
+    "Filename cannot contain path traversal sequences",
   )
   .refine(
-    (name) =>
-      !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i.test(name),
-    "Filename is a reserved system name"
+    (name) => !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i.test(name),
+    "Filename is a reserved system name",
   );
 
 /**
@@ -67,7 +74,7 @@ const contentTypeSchema = z
   .string()
   .regex(
     /^[a-z]+\/[a-z0-9.+-]+(\s*;\s*[a-z0-9-]+=\S+)*$/i,
-    "Invalid MIME type format"
+    "Invalid MIME type format",
   )
   .optional();
 
@@ -79,92 +86,105 @@ const contentTypeSchema = z
 const fileSizeSchema = z
   .number()
   .positive("File size must be positive")
-  .max(MAX_FILE_SIZE, `File size cannot exceed ${MAX_FILE_SIZE / (1024 * 1024 * 1024)}GB`);
+  .max(
+    MAX_FILE_SIZE,
+    `File size cannot exceed ${MAX_FILE_SIZE / (1024 * 1024 * 1024)}GB`,
+  );
 
 // Helper: Get user ID from session
 const getUserId = (ctx: { session: { user: { id: string } } }) =>
   ctx.session.user.id;
 
+// Helper: Serialize a lean folder document to the API shape the client expects
+function serializeFolder(folder: {
+  _id: unknown;
+  name: string;
+  userId: unknown;
+  parentId?: unknown;
+  createdAt?: Date;
+  updatedAt?: Date;
+  deletedAt?: Date | null;
+}) {
+  return {
+    id: String(folder._id),
+    name: folder.name,
+    userId: idString(folder.userId),
+    parentId: idString(folder.parentId),
+    createdAt: folder.createdAt,
+    updatedAt: folder.updatedAt,
+    deletedAt: folder.deletedAt ?? null,
+  };
+}
+
+// Helper: Serialize a lean asset document to the API shape the client expects
+function serializeAsset(asset: {
+  _id: unknown;
+  name: string;
+  contentType?: string | null;
+  userId: unknown;
+  folderId?: unknown;
+  fileHash: string;
+  isPublic?: boolean;
+  publicShareId?: string | null;
+  downloadCount?: number;
+  deletedAt?: Date | null;
+  createdAt?: Date;
+  updatedAt?: Date;
+}) {
+  return {
+    id: String(asset._id),
+    name: asset.name,
+    contentType: asset.contentType ?? null,
+    userId: idString(asset.userId),
+    folderId: idString(asset.folderId),
+    fileHash: asset.fileHash,
+    isPublic: asset.isPublic ?? false,
+    publicShareId: asset.publicShareId ?? null,
+    downloadCount: asset.downloadCount ?? 0,
+    deletedAt: asset.deletedAt ?? null,
+    createdAt: asset.createdAt,
+    updatedAt: asset.updatedAt,
+  };
+}
+
 // Helper: Check and enforce rate limit
+//
+// Only mutations are rate-limited; reads are free so a dashboard that fires
+// several queries on load can never trip its own limiter. One document per user
+// per one-second window is incremented atomically, so concurrent requests cannot
+// lose counts. A request that pushes the count past the cap is rejected — it
+// still consumes a slot, which is race-safe and prevents bursts. Stale windows
+// are removed by the collection's TTL index, not by this code.
 async function checkRateLimit(userId: string): Promise<void> {
   const now = new Date();
   const windowStart = new Date(
-    Math.floor(now.getTime() / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_WINDOW_MS
+    Math.floor(now.getTime() / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_WINDOW_MS,
   );
+  const userObjectId = toObjectId(userId);
 
-  // Get user's rate limit setting
-  const quota = await db.query.userQuotas.findFirst({
-    where: eq(userQuotas.userId, userId),
-  });
-  const rateLimit = quota?.rateLimit ?? DEFAULT_RATE_LIMIT;
+  const quota = await readQuota(userObjectId);
+  const rateLimit = quota.rateLimit ?? DEFAULT_RATE_LIMIT;
 
-  // Check current window
-  const currentWindow = await db.query.rateLimitWindows.findFirst({
-    where: and(
-      eq(rateLimitWindows.userId, userId),
-      eq(rateLimitWindows.windowStart, windowStart)
-    ),
-  });
+  const window = await RateLimitWindow.findOneAndUpdate(
+    { userId: userObjectId, windowStart },
+    { $inc: { requestCount: 1 } },
+    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
+  ).lean();
 
-  if (currentWindow && currentWindow.requestCount >= rateLimit) {
+  if ((window?.requestCount ?? 1) > rateLimit) {
     throw new TRPCError({
       code: "TOO_MANY_REQUESTS",
       message: `Rate limit exceeded. Maximum ${rateLimit} requests per second.`,
     });
-  }
-
-  // Increment or create window
-  if (currentWindow) {
-    await db
-      .update(rateLimitWindows)
-      .set({ requestCount: sql`${rateLimitWindows.requestCount} + 1` })
-      .where(eq(rateLimitWindows.id, currentWindow.id));
-  } else {
-    await db.insert(rateLimitWindows).values({
-      userId,
-      windowStart,
-      requestCount: 1,
-    });
-
-    // Clean up old windows (older than 1 minute)
-    const cutoff = new Date(now.getTime() - 60000);
-    await db
-      .delete(rateLimitWindows)
-      .where(
-        and(
-          eq(rateLimitWindows.userId, userId),
-          sql`${rateLimitWindows.windowStart} < ${cutoff}`
-        )
-      );
   }
 }
 
 // Helper: Check storage quota
 async function checkStorageQuota(
   userId: string,
-  additionalBytes: number
+  additionalBytes: number,
 ): Promise<void> {
-  // Get or create user quota
-  let quota = await db.query.userQuotas.findFirst({
-    where: eq(userQuotas.userId, userId),
-  });
-
-  if (!quota) {
-    // Create default quota for user
-    await db.insert(userQuotas).values({
-      userId,
-      storageUsed: 0,
-      storageLimit: DEFAULT_STORAGE_LIMIT,
-      rateLimit: DEFAULT_RATE_LIMIT,
-    });
-    quota = {
-      userId,
-      storageUsed: 0,
-      storageLimit: DEFAULT_STORAGE_LIMIT,
-      rateLimit: DEFAULT_RATE_LIMIT,
-      updatedAt: new Date(),
-    };
-  }
+  const quota = await ensureQuota(toObjectId(userId));
 
   if (quota.storageUsed + additionalBytes > quota.storageLimit) {
     throw new TRPCError({
@@ -174,27 +194,6 @@ async function checkStorageQuota(
   }
 }
 
-// Helper: Update storage usage
-async function updateStorageUsage(
-  userId: string,
-  deltaBytes: number
-): Promise<void> {
-  await db
-    .insert(userQuotas)
-    .values({
-      userId,
-      storageUsed: Math.max(0, deltaBytes),
-      storageLimit: DEFAULT_STORAGE_LIMIT,
-      rateLimit: DEFAULT_RATE_LIMIT,
-    })
-    .onConflictDoUpdate({
-      target: userQuotas.userId,
-      set: {
-        storageUsed: sql`GREATEST(0, ${userQuotas.storageUsed} + ${deltaBytes})`,
-      },
-    });
-}
-
 // Helper: Format bytes for display
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 Bytes";
@@ -202,6 +201,73 @@ function formatBytes(bytes: number): string {
   const sizes = ["Bytes", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+
+/**
+ * Delete one asset claim and release its blob reference.
+ *
+ * Every deletion path funnels through here: permanent-delete, folder hard-delete,
+ * and empty-trash all drop the claim, decrement the blob's refCount, and — when
+ * the last reference goes — record the blob key for removal from object storage
+ * and drop the registry entry. Returns the freed logical bytes and, if the blob
+ * is now unreferenced, the R2 key to delete *after* the transaction commits
+ * (object storage is not transactional).
+ */
+async function releaseAsset(
+  session: Session,
+  asset: { _id: Oid; fileHash: string },
+  blobSize: number,
+): Promise<{ freedBytes: number; blobToDelete: string | null }> {
+  await Asset.deleteOne({ _id: asset._id }, { session });
+
+  const updatedFile = await File.findOneAndUpdate(
+    { _id: asset.fileHash },
+    { $inc: { refCount: -1 } },
+    { returnDocument: "after", session },
+  ).lean();
+
+  let blobToDelete: string | null = null;
+  if (updatedFile && updatedFile.refCount <= 0) {
+    blobToDelete = updatedFile.path;
+    await File.deleteOne({ _id: asset.fileHash }, { session });
+  }
+
+  return { freedBytes: blobSize, blobToDelete };
+}
+
+/**
+ * Collect a folder and its descendants.
+ *
+ * `filter` decides which folders are included: `{ deletedAt: null }` for live
+ * folders being trashed, `{ deletedAt: { $ne: null } }` for restoring, and `{}`
+ * for permanent deletion. The tree is walked in application code, as the design
+ * document specifies, because folder trees are shallow and bounded.
+ */
+async function collectSubtree(
+  userId: Oid,
+  rootId: Oid,
+  filter: Record<string, unknown>,
+): Promise<Oid[]> {
+  const children = await Folder.find({ userId, parentId: rootId, ...filter })
+    .select("_id")
+    .lean();
+
+  const ids: Oid[] = [rootId];
+  for (const child of children) {
+    ids.push(...(await collectSubtree(userId, child._id, filter)));
+  }
+  return ids;
+}
+
+/** True when `checkId` sits below `ancestorId` in the folder tree. */
+async function isDescendant(
+  ancestorId: string,
+  checkId: string | Oid,
+): Promise<boolean> {
+  const check = await Folder.findById(checkId).select("parentId").lean();
+  if (!check || !check.parentId) return false;
+  if (String(check.parentId) === ancestorId) return true;
+  return isDescendant(ancestorId, check.parentId);
 }
 
 // Rate limited procedure - wraps protectedProcedure with rate limit check
@@ -226,47 +292,51 @@ export const storageRouter = router({
         size: fileSizeSchema,
         hash: z.string().regex(/^[a-f0-9]{64}$/i, "Invalid SHA-256 hash"),
         contentType: contentTypeSchema,
-        folderId: z.string().uuid().optional(),
-      })
+        folderId: objectIdSchema.optional(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Check storage quota before proceeding
       await checkStorageQuota(userId, input.size);
 
-      // Check for deduplication
-      const existingFile = await db.query.files.findFirst({
-        where: eq(files.hash, input.hash),
-      });
+      // Check for deduplication: one point-read on the content hash.
+      const existingFile = await File.findById(input.hash).lean();
 
       if (existingFile) {
-        // File content already exists - create reference without uploading
-        await db.transaction(async (tx) => {
-          // Create user asset linking to existing file
-          await tx.insert(userAssets).values({
-            name: input.filename,
-            contentType: input.contentType ?? null,
-            userId,
-            folderId: input.folderId ?? null,
-            fileHash: existingFile.hash,
-          });
+        // File content already exists - create a reference without uploading.
+        // The asset insert, ref-count bump, and quota delta commit together.
+        await withTransaction(async (session) => {
+          await Asset.create(
+            [
+              {
+                name: input.filename,
+                contentType: input.contentType ?? null,
+                userId: userObjectId,
+                folderId: input.folderId ? toObjectId(input.folderId) : null,
+                fileHash: existingFile._id,
+              },
+            ],
+            { session },
+          );
 
-          // Increment reference count
-          await tx
-            .update(files)
-            .set({ refCount: sql`${files.refCount} + 1` })
-            .where(eq(files.hash, existingFile.hash));
+          await File.updateOne(
+            { _id: existingFile._id },
+            { $inc: { refCount: 1 } },
+            { session },
+          );
+
+          await adjustStorageUsed(userId, input.size, session);
         });
-
-        // Update user's storage usage (still counts against their quota)
-        await updateStorageUsage(userId, input.size);
 
         return {
           deduplicated: true,
           url: null,
           key: null,
-          message: "File already exists, created reference without re-uploading",
+          message:
+            "File already exists, created reference without re-uploading",
         };
       }
 
@@ -295,48 +365,50 @@ export const storageRouter = router({
         size: fileSizeSchema,
         hash: z.string().regex(/^[a-f0-9]{64}$/i, "Invalid SHA-256 hash"),
         contentType: contentTypeSchema,
-        folderId: z.string().uuid().optional(),
-      })
+        folderId: objectIdSchema.optional(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Verify file exists in S3
       const exists = await s3.file(input.hash).exists();
       if (!exists) {
         throw new TRPCError({
           code: "NOT_FOUND",
-          message: "File upload verification failed. File not found in storage.",
+          message:
+            "File upload verification failed. File not found in storage.",
         });
       }
 
-      await db.transaction(async (tx) => {
-        // Create or update file record
-        await tx
-          .insert(files)
-          .values({
-            hash: input.hash,
-            size: input.size,
-            path: input.hash,
-            refCount: 1,
-          })
-          .onConflictDoUpdate({
-            target: files.hash,
-            set: { refCount: sql`${files.refCount} + 1` },
-          });
+      await withTransaction(async (session) => {
+        // Upsert the blob registry: a new content hash inserts the blob, an
+        // existing one (concurrent confirm or dedup hit) bumps the ref count.
+        await File.updateOne(
+          { _id: input.hash },
+          {
+            $setOnInsert: { size: input.size, path: input.hash },
+            $inc: { refCount: 1 },
+          },
+          { upsert: true, session },
+        );
 
-        // Create user asset
-        await tx.insert(userAssets).values({
-          name: input.filename,
-          contentType: input.contentType ?? null,
-          userId,
-          folderId: input.folderId ?? null,
-          fileHash: input.hash,
-        });
+        await Asset.create(
+          [
+            {
+              name: input.filename,
+              contentType: input.contentType ?? null,
+              userId: userObjectId,
+              folderId: input.folderId ? toObjectId(input.folderId) : null,
+              fileHash: input.hash,
+            },
+          ],
+          { session },
+        );
+
+        await adjustStorageUsed(userId, input.size, session);
       });
-
-      // Update storage usage
-      await updateStorageUsage(userId, input.size);
 
       return { success: true, message: "File uploaded and confirmed" };
     }),
@@ -348,62 +420,66 @@ export const storageRouter = router({
   /**
    * List files and folders for the current user
    */
-  listFiles: rateLimitedProcedure
+  listFiles: protectedProcedure
     .input(
       z
         .object({
-          folderId: z.string().uuid().optional(),
+          folderId: objectIdSchema.optional(),
         })
-        .optional()
+        .optional(),
     )
     .query(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
+      const folderObjectId = input?.folderId
+        ? toObjectId(input.folderId)
+        : null;
 
-      // Get files in the specified folder (or root if no folderId)
-      // Exclude trashed items (deletedAt is not null)
-      const assets = await db.query.userAssets.findMany({
-        where: and(
-          eq(userAssets.userId, userId),
-          isNull(userAssets.deletedAt),
-          input?.folderId
-            ? eq(userAssets.folderId, input.folderId)
-            : isNull(userAssets.folderId)
-        ),
-        with: { file: true },
-        orderBy: [desc(userAssets.createdAt)],
+      // Files in the specified folder (or root), newest first, trash hidden.
+      const assets = await Asset.find({
+        userId: userObjectId,
+        folderId: folderObjectId,
+        deletedAt: null,
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      // Resolve the shared blobs in one query instead of per-asset lookups.
+      const hashes = [...new Set(assets.map((asset) => asset.fileHash))];
+      const blobs = await File.find({ _id: { $in: hashes } }).lean();
+      const blobByHash = new Map(blobs.map((blob) => [blob._id, blob]));
+
+      const formattedFiles = assets.map((asset) => {
+        const blob = blobByHash.get(asset.fileHash);
+        const refCount = blob?.refCount ?? 1;
+        return {
+          id: String(asset._id),
+          name: asset.name,
+          size: blob?.size ?? 0,
+          contentType: asset.contentType,
+          uploadDate: asset.createdAt,
+          uploader: userId,
+          isOriginal: refCount === 1,
+          isDeduplicated: refCount > 1,
+          refCount,
+          isPublic: asset.isPublic,
+          publicShareId: asset.publicShareId,
+          downloadCount: asset.downloadCount,
+        };
       });
 
-      // Get subfolders (exclude trashed)
-      const userFolders = await db.query.folders.findMany({
-        where: and(
-          eq(folders.userId, userId),
-          isNull(folders.deletedAt),
-          input?.folderId
-            ? eq(folders.parentId, input.folderId)
-            : isNull(folders.parentId)
-        ),
-        orderBy: [desc(folders.createdAt)],
-      });
-
-      // Format response with deduplication status
-      const formattedFiles = assets.map((asset) => ({
-        id: asset.id,
-        name: asset.name,
-        size: asset.file.size,
-        contentType: asset.contentType,
-        uploadDate: asset.createdAt,
-        uploader: userId, // In a full implementation, fetch user name
-        isOriginal: asset.file.refCount === 1,
-        isDeduplicated: asset.file.refCount > 1,
-        refCount: asset.file.refCount,
-        isPublic: asset.isPublic,
-        publicShareId: asset.publicShareId,
-        downloadCount: asset.downloadCount,
-      }));
+      // Subfolders (trash hidden), newest first.
+      const userFolders = await Folder.find({
+        userId: userObjectId,
+        parentId: folderObjectId,
+        deletedAt: null,
+      })
+        .sort({ createdAt: -1 })
+        .lean();
 
       return {
         files: formattedFiles,
-        folders: userFolders,
+        folders: userFolders.map(serializeFolder),
         currentFolderId: input?.folderId ?? null,
       };
     }),
@@ -411,19 +487,16 @@ export const storageRouter = router({
   /**
    * Get file details
    */
-  getFile: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+  getFile: protectedProcedure
+    .input(z.object({ id: objectIdSchema }))
     .query(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
 
-      const asset = await db.query.userAssets.findFirst({
-        where: and(
-          eq(userAssets.id, input.id),
-          eq(userAssets.userId, userId),
-          isNull(userAssets.deletedAt)
-        ),
-        with: { file: true, folder: true },
-      });
+      const asset = await Asset.findOne({
+        _id: toObjectId(input.id),
+        userId: toObjectId(userId),
+        deletedAt: null,
+      }).lean();
 
       if (!asset) {
         throw new TRPCError({
@@ -432,21 +505,33 @@ export const storageRouter = router({
         });
       }
 
+      const blob = await File.findById(asset.fileHash).lean();
+      if (!blob) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "File content not found",
+        });
+      }
+
+      const folder = asset.folderId
+        ? await Folder.findById(asset.folderId).lean()
+        : null;
+
       // Generate download URL
-      const downloadUrl = s3.presign(asset.file.path, {
+      const downloadUrl = s3.presign(blob.path, {
         expiresIn: 3600,
       });
 
       return {
-        id: asset.id,
+        id: String(asset._id),
         name: asset.name,
-        size: asset.file.size,
+        size: blob.size,
         contentType: asset.contentType,
         uploadDate: asset.createdAt,
-        folder: asset.folder,
-        isOriginal: asset.file.refCount === 1,
-        isDeduplicated: asset.file.refCount > 1,
-        refCount: asset.file.refCount,
+        folder: folder ? serializeFolder(folder) : null,
+        isOriginal: blob.refCount === 1,
+        isDeduplicated: blob.refCount > 1,
+        refCount: blob.refCount,
         isPublic: asset.isPublic,
         publicShareId: asset.publicShareId,
         downloadCount: asset.downloadCount,
@@ -458,21 +543,20 @@ export const storageRouter = router({
   // FOLDER MANAGEMENT
   // ============================================
 
-/**
+  /**
    * List only folders (lightweight query for sidebar)
    */
   listFolders: protectedProcedure.query(async ({ ctx }) => {
     const userId = getUserId(ctx);
 
-    const userFolders = await db.query.folders.findMany({
-      where: and(
-        eq(folders.userId, userId),
-        isNull(folders.deletedAt)
-      ),
-      orderBy: [desc(folders.createdAt)],
-    });
+    const userFolders = await Folder.find({
+      userId: toObjectId(userId),
+      deletedAt: null,
+    })
+      .sort({ createdAt: -1 })
+      .lean();
 
-    return userFolders;
+    return userFolders.map(serializeFolder);
   }),
 
   /**
@@ -482,20 +566,19 @@ export const storageRouter = router({
     .input(
       z.object({
         name: filenameSchema,
-        parentId: z.string().uuid().optional(),
-      })
+        parentId: objectIdSchema.optional(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Verify parent folder exists and belongs to user if specified
       if (input.parentId) {
-        const parentFolder = await db.query.folders.findFirst({
-          where: and(
-            eq(folders.id, input.parentId),
-            eq(folders.userId, userId)
-          ),
-        });
+        const parentFolder = await Folder.findOne({
+          _id: toObjectId(input.parentId),
+          userId: userObjectId,
+        }).lean();
         if (!parentFolder) {
           throw new TRPCError({
             code: "NOT_FOUND",
@@ -504,16 +587,13 @@ export const storageRouter = router({
         }
       }
 
-      const [folder] = await db
-        .insert(folders)
-        .values({
-          name: input.name,
-          parentId: input.parentId ?? null,
-          userId,
-        })
-        .returning();
+      const folder = await Folder.create({
+        name: input.name,
+        parentId: input.parentId ? toObjectId(input.parentId) : null,
+        userId: userObjectId,
+      });
 
-      return { success: true, folder };
+      return { success: true, folder: serializeFolder(folder.toObject()) };
     }),
 
   /**
@@ -522,18 +602,18 @@ export const storageRouter = router({
   renameFolder: rateLimitedProcedure
     .input(
       z.object({
-        id: z.string().uuid(),
+        id: objectIdSchema,
         name: filenameSchema,
-      })
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
 
-      const [updated] = await db
-        .update(folders)
-        .set({ name: input.name })
-        .where(and(eq(folders.id, input.id), eq(folders.userId, userId)))
-        .returning();
+      const updated = await Folder.findOneAndUpdate(
+        { _id: toObjectId(input.id), userId: toObjectId(userId) },
+        { name: input.name },
+        { returnDocument: "after" },
+      ).lean();
 
       if (!updated) {
         throw new TRPCError({
@@ -542,21 +622,23 @@ export const storageRouter = router({
         });
       }
 
-      return { success: true, folder: updated };
+      return { success: true, folder: serializeFolder(updated) };
     }),
 
   /**
    * Delete a folder (must be empty)
    */
   deleteFolder: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const folderId = toObjectId(input.id);
 
       // Check folder exists and belongs to user
-      const folder = await db.query.folders.findFirst({
-        where: and(eq(folders.id, input.id), eq(folders.userId, userId)),
-      });
+      const folder = await Folder.findOne({
+        _id: folderId,
+        userId: toObjectId(userId),
+      }).lean();
 
       if (!folder) {
         throw new TRPCError({
@@ -566,12 +648,8 @@ export const storageRouter = router({
       }
 
       // Check if folder has contents
-      const hasFiles = await db.query.userAssets.findFirst({
-        where: eq(userAssets.folderId, input.id),
-      });
-      const hasSubfolders = await db.query.folders.findFirst({
-        where: eq(folders.parentId, input.id),
-      });
+      const hasFiles = await Asset.exists({ folderId });
+      const hasSubfolders = await Folder.exists({ parentId: folderId });
 
       if (hasFiles || hasSubfolders) {
         throw new TRPCError({
@@ -580,7 +658,7 @@ export const storageRouter = router({
         });
       }
 
-      await db.delete(folders).where(eq(folders.id, input.id));
+      await Folder.deleteOne({ _id: folderId });
 
       return { success: true };
     }),
@@ -590,19 +668,18 @@ export const storageRouter = router({
    * Moves the folder and all its contents (files and subfolders) to trash
    */
   moveFolderToTrash: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
       const now = new Date();
 
       // Check folder exists and belongs to user
-      const folder = await db.query.folders.findFirst({
-        where: and(
-          eq(folders.id, input.id),
-          eq(folders.userId, userId),
-          isNull(folders.deletedAt)
-        ),
-      });
+      const folder = await Folder.findOne({
+        _id: toObjectId(input.id),
+        userId: userObjectId,
+        deletedAt: null,
+      }).lean();
 
       if (!folder) {
         throw new TRPCError({
@@ -611,52 +688,29 @@ export const storageRouter = router({
         });
       }
 
-      // Recursively collect all folder IDs to trash
-      async function collectFolderIds(folderId: string): Promise<string[]> {
-        const subfolders = await db.query.folders.findMany({
-          where: and(
-            eq(folders.parentId, folderId),
-            eq(folders.userId, userId),
-            isNull(folders.deletedAt)
-          ),
-        });
-
-        const ids = [folderId];
-        for (const subfolder of subfolders) {
-          const subIds = await collectFolderIds(subfolder.id);
-          ids.push(...subIds);
-        }
-        return ids;
-      }
-
-      const folderIds = await collectFolderIds(input.id);
-
-      await db.transaction(async (tx) => {
-        // Trash all files in these folders
-        if (folderIds.length > 0) {
-          await tx
-            .update(userAssets)
-            .set({ deletedAt: now })
-            .where(
-              and(
-                eq(userAssets.userId, userId),
-                isNull(userAssets.deletedAt),
-                sql`${userAssets.folderId} IN (${sql.join(folderIds.map(id => sql`${id}`), sql`, `)})`
-              )
-            );
-        }
-
-        // Trash all folders
-        for (const folderId of folderIds) {
-          await tx
-            .update(folders)
-            .set({ deletedAt: now })
-            .where(eq(folders.id, folderId));
-        }
+      // Collect the folder and every live descendant to trash.
+      const folderIds = await collectSubtree(userObjectId, folder._id, {
+        deletedAt: null,
       });
 
-      return { 
-        success: true, 
+      await withTransaction(async (session) => {
+        // Trash all live files in these folders.
+        await Asset.updateMany(
+          { userId: userObjectId, deletedAt: null, folderId: { $in: folderIds } },
+          { $set: { deletedAt: now } },
+          { session },
+        );
+
+        // Trash all folders in the subtree.
+        await Folder.updateMany(
+          { _id: { $in: folderIds } },
+          { $set: { deletedAt: now } },
+          { session },
+        );
+      });
+
+      return {
+        success: true,
         message: "Folder and contents moved to trash",
         trashedFolders: folderIds.length,
       };
@@ -667,18 +721,17 @@ export const storageRouter = router({
    * Restores the folder and all its contents
    */
   restoreFolderFromTrash: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Check folder exists and is in trash
-      const folder = await db.query.folders.findFirst({
-        where: and(
-          eq(folders.id, input.id),
-          eq(folders.userId, userId),
-          isNotNull(folders.deletedAt)
-        ),
-      });
+      const folder = await Folder.findOne({
+        _id: toObjectId(input.id),
+        userId: userObjectId,
+        deletedAt: { $ne: null },
+      }).lean();
 
       if (!folder) {
         throw new TRPCError({
@@ -689,12 +742,10 @@ export const storageRouter = router({
 
       // Check if parent folder exists and is not trashed (if not root)
       if (folder.parentId) {
-        const parentFolder = await db.query.folders.findFirst({
-          where: and(
-            eq(folders.id, folder.parentId),
-            eq(folders.userId, userId)
-          ),
-        });
+        const parentFolder = await Folder.findOne({
+          _id: folder.parentId,
+          userId: userObjectId,
+        }).lean();
 
         if (!parentFolder) {
           throw new TRPCError({
@@ -706,57 +757,39 @@ export const storageRouter = router({
         if (parentFolder.deletedAt) {
           throw new TRPCError({
             code: "PRECONDITION_FAILED",
-            message: "Parent folder is in trash. Restore it first or restore this folder to root.",
+            message:
+              "Parent folder is in trash. Restore it first or restore this folder to root.",
           });
         }
       }
 
-      // Recursively collect all trashed folder IDs under this folder
-      async function collectTrashedFolderIds(folderId: string): Promise<string[]> {
-        const subfolders = await db.query.folders.findMany({
-          where: and(
-            eq(folders.parentId, folderId),
-            eq(folders.userId, userId),
-            isNotNull(folders.deletedAt)
-          ),
-        });
-
-        const ids = [folderId];
-        for (const subfolder of subfolders) {
-          const subIds = await collectTrashedFolderIds(subfolder.id);
-          ids.push(...subIds);
-        }
-        return ids;
-      }
-
-      const folderIds = await collectTrashedFolderIds(input.id);
-
-      await db.transaction(async (tx) => {
-        // Restore all files in these folders
-        if (folderIds.length > 0) {
-          await tx
-            .update(userAssets)
-            .set({ deletedAt: null })
-            .where(
-              and(
-                eq(userAssets.userId, userId),
-                isNotNull(userAssets.deletedAt),
-                sql`${userAssets.folderId} IN (${sql.join(folderIds.map(id => sql`${id}`), sql`, `)})`
-              )
-            );
-        }
-
-        // Restore all folders
-        for (const folderId of folderIds) {
-          await tx
-            .update(folders)
-            .set({ deletedAt: null })
-            .where(eq(folders.id, folderId));
-        }
+      // Collect the folder and every trashed descendant.
+      const folderIds = await collectSubtree(userObjectId, folder._id, {
+        deletedAt: { $ne: null },
       });
 
-      return { 
-        success: true, 
+      await withTransaction(async (session) => {
+        // Restore all files in these folders.
+        await Asset.updateMany(
+          {
+            userId: userObjectId,
+            deletedAt: { $ne: null },
+            folderId: { $in: folderIds },
+          },
+          { $set: { deletedAt: null } },
+          { session },
+        );
+
+        // Restore all folders in the subtree.
+        await Folder.updateMany(
+          { _id: { $in: folderIds } },
+          { $set: { deletedAt: null } },
+          { session },
+        );
+      });
+
+      return {
+        success: true,
         message: "Folder and contents restored from trash",
         restoredFolders: folderIds.length,
       };
@@ -772,47 +805,39 @@ export const storageRouter = router({
    * Actual S3 content only deleted when all references are gone
    */
   deleteAsset: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
 
       // Find the asset - must belong to current user
-      const asset = await db.query.userAssets.findFirst({
-        where: and(eq(userAssets.id, input.id), eq(userAssets.userId, userId)),
-        with: { file: true },
-      });
+      const asset = await Asset.findOne({
+        _id: toObjectId(input.id),
+        userId: toObjectId(userId),
+      }).lean();
 
       if (!asset) {
         throw new TRPCError({
           code: "NOT_FOUND",
-          message:
-            "File not found or you do not have permission to delete it",
+          message: "File not found or you do not have permission to delete it",
         });
       }
 
-      const fileSize = asset.file.size;
-      const fileHash = asset.fileHash;
+      const blob = await File.findById(asset.fileHash).lean();
+      const fileSize = blob?.size ?? 0;
 
-      await db.transaction(async (tx) => {
-        // Delete the user asset
-        await tx.delete(userAssets).where(eq(userAssets.id, input.id));
+      // Side effects (the R2 delete) are not transactional, so collect the blob
+      // to remove and fire it only after the transaction commits.
+      let blobToDelete: string | null = null;
 
-        // Decrement reference count
-        const [updatedFile] = await tx
-          .update(files)
-          .set({ refCount: sql`${files.refCount} - 1` })
-          .where(eq(files.hash, fileHash))
-          .returning();
-
-        // If no more references, delete from S3 and database
-        if (updatedFile && updatedFile.refCount <= 0) {
-          await s3.file(updatedFile.path).delete();
-          await tx.delete(files).where(eq(files.hash, fileHash));
-        }
+      await withTransaction(async (session) => {
+        const released = await releaseAsset(session, asset, fileSize);
+        blobToDelete = released.blobToDelete;
+        await adjustStorageUsed(userId, -released.freedBytes, session);
       });
 
-      // Update storage usage (decrease)
-      await updateStorageUsage(userId, -fileSize);
+      if (blobToDelete) {
+        await s3.file(blobToDelete).delete();
+      }
 
       return { success: true, message: "File deleted successfully" };
     }),
@@ -825,21 +850,19 @@ export const storageRouter = router({
    * Move a file to trash (soft delete)
    */
   moveToTrash: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
 
-      const [updated] = await db
-        .update(userAssets)
-        .set({ deletedAt: new Date() })
-        .where(
-          and(
-            eq(userAssets.id, input.id),
-            eq(userAssets.userId, userId),
-            isNull(userAssets.deletedAt)
-          )
-        )
-        .returning();
+      const updated = await Asset.findOneAndUpdate(
+        {
+          _id: toObjectId(input.id),
+          userId: toObjectId(userId),
+          deletedAt: null,
+        },
+        { $set: { deletedAt: new Date() } },
+        { returnDocument: "after" },
+      ).lean();
 
       if (!updated) {
         throw new TRPCError({
@@ -855,21 +878,19 @@ export const storageRouter = router({
    * Restore a file from trash
    */
   restoreFromTrash: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
 
-      const [updated] = await db
-        .update(userAssets)
-        .set({ deletedAt: null })
-        .where(
-          and(
-            eq(userAssets.id, input.id),
-            eq(userAssets.userId, userId),
-            isNotNull(userAssets.deletedAt)
-          )
-        )
-        .returning();
+      const updated = await Asset.findOneAndUpdate(
+        {
+          _id: toObjectId(input.id),
+          userId: toObjectId(userId),
+          deletedAt: { $ne: null },
+        },
+        { $set: { deletedAt: null } },
+        { returnDocument: "after" },
+      ).lean();
 
       if (!updated) {
         throw new TRPCError({
@@ -884,50 +905,51 @@ export const storageRouter = router({
   /**
    * List files and folders in trash
    */
-  listTrash: rateLimitedProcedure.query(async ({ ctx }) => {
+  listTrash: protectedProcedure.query(async ({ ctx }) => {
     const userId = getUserId(ctx);
+    const userObjectId = toObjectId(userId);
 
     // Get trashed files
-    const trashedAssets = await db.query.userAssets.findMany({
-      where: and(
-        eq(userAssets.userId, userId),
-        isNotNull(userAssets.deletedAt)
-      ),
-      with: { file: true },
-      orderBy: [desc(userAssets.deletedAt)],
-    });
+    const trashedAssets = await Asset.find({
+      userId: userObjectId,
+      deletedAt: { $ne: null },
+    })
+      .sort({ deletedAt: -1 })
+      .lean();
 
-    // Get trashed folders (only top-level trashed folders - those whose parent is not trashed or is null)
-    const allTrashedFolders = await db.query.folders.findMany({
-      where: and(
-        eq(folders.userId, userId),
-        isNotNull(folders.deletedAt)
-      ),
-      orderBy: [desc(folders.deletedAt)],
-    });
+    const hashes = [...new Set(trashedAssets.map((asset) => asset.fileHash))];
+    const blobs = await File.find({ _id: { $in: hashes } }).lean();
+    const blobByHash = new Map(blobs.map((blob) => [blob._id, blob]));
 
-    // Filter to only show "root" trashed folders (parent not trashed or no parent)
-    const trashedFolderIds = new Set(allTrashedFolders.map(f => f.id));
-    const topLevelTrashedFolders = allTrashedFolders.filter(folder => {
-      // If no parent, it's a top-level trashed folder
+    // Get trashed folders (only top-level trashed folders - those whose parent
+    // is not trashed or is null)
+    const allTrashedFolders = await Folder.find({
+      userId: userObjectId,
+      deletedAt: { $ne: null },
+    })
+      .sort({ deletedAt: -1 })
+      .lean();
+
+    const trashedFolderIds = new Set(
+      allTrashedFolders.map((folder) => String(folder._id)),
+    );
+    const topLevelTrashedFolders = allTrashedFolders.filter((folder) => {
       if (!folder.parentId) return true;
-      // If parent is not in trash, show this folder
-      if (!trashedFolderIds.has(folder.parentId)) return true;
-      // Otherwise, it's nested within a trashed folder - don't show at top level
+      if (!trashedFolderIds.has(String(folder.parentId))) return true;
       return false;
     });
 
     const files = trashedAssets.map((asset) => ({
-      id: asset.id,
+      id: String(asset._id),
       type: "file" as const,
       name: asset.name,
-      size: asset.file.size,
+      size: blobByHash.get(asset.fileHash)?.size ?? 0,
       deletedAt: asset.deletedAt,
       uploadDate: asset.createdAt,
     }));
 
     const trashedFolders = topLevelTrashedFolders.map((folder) => ({
-      id: folder.id,
+      id: String(folder._id),
       type: "folder" as const,
       name: folder.name,
       deletedAt: folder.deletedAt,
@@ -944,19 +966,16 @@ export const storageRouter = router({
    * Permanently delete a file from trash
    */
   permanentlyDelete: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
 
       // Find the asset in trash
-      const asset = await db.query.userAssets.findFirst({
-        where: and(
-          eq(userAssets.id, input.id),
-          eq(userAssets.userId, userId),
-          isNotNull(userAssets.deletedAt)
-        ),
-        with: { file: true },
-      });
+      const asset = await Asset.findOne({
+        _id: toObjectId(input.id),
+        userId: toObjectId(userId),
+        deletedAt: { $ne: null },
+      }).lean();
 
       if (!asset) {
         throw new TRPCError({
@@ -965,29 +984,19 @@ export const storageRouter = router({
         });
       }
 
-      const fileSize = asset.file.size;
-      const fileHash = asset.fileHash;
+      const blob = await File.findById(asset.fileHash).lean();
+      const fileSize = blob?.size ?? 0;
+      let blobToDelete: string | null = null;
 
-      await db.transaction(async (tx) => {
-        // Delete the user asset
-        await tx.delete(userAssets).where(eq(userAssets.id, input.id));
-
-        // Decrement reference count
-        const [updatedFile] = await tx
-          .update(files)
-          .set({ refCount: sql`${files.refCount} - 1` })
-          .where(eq(files.hash, fileHash))
-          .returning();
-
-        // If no more references, delete from S3 and database
-        if (updatedFile && updatedFile.refCount <= 0) {
-          await s3.file(updatedFile.path).delete();
-          await tx.delete(files).where(eq(files.hash, fileHash));
-        }
+      await withTransaction(async (session) => {
+        const released = await releaseAsset(session, asset, fileSize);
+        blobToDelete = released.blobToDelete;
+        await adjustStorageUsed(userId, -released.freedBytes, session);
       });
 
-      // Update storage usage (decrease)
-      await updateStorageUsage(userId, -fileSize);
+      if (blobToDelete) {
+        await s3.file(blobToDelete).delete();
+      }
 
       return { success: true, message: "File permanently deleted" };
     }),
@@ -997,18 +1006,17 @@ export const storageRouter = router({
    * Deletes the folder and all its contents permanently
    */
   permanentlyDeleteFolder: rateLimitedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: objectIdSchema }))
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Find the folder in trash
-      const folder = await db.query.folders.findFirst({
-        where: and(
-          eq(folders.id, input.id),
-          eq(folders.userId, userId),
-          isNotNull(folders.deletedAt)
-        ),
-      });
+      const folder = await Folder.findOne({
+        _id: toObjectId(input.id),
+        userId: userObjectId,
+        deletedAt: { $ne: null },
+      }).lean();
 
       if (!folder) {
         throw new TRPCError({
@@ -1017,65 +1025,48 @@ export const storageRouter = router({
         });
       }
 
-      // Recursively collect all folder IDs
-      async function collectAllFolderIds(folderId: string): Promise<string[]> {
-        const subfolders = await db.query.folders.findMany({
-          where: and(
-            eq(folders.parentId, folderId),
-            eq(folders.userId, userId)
-          ),
-        });
+      // Collect the folder and every descendant, trashed or not.
+      const folderIds = await collectSubtree(userObjectId, folder._id, {});
 
-        const ids = [folderId];
-        for (const subfolder of subfolders) {
-          const subIds = await collectAllFolderIds(subfolder.id);
-          ids.push(...subIds);
+      // Get all files in these folders.
+      const assetsInFolders = await Asset.find({
+        userId: userObjectId,
+        folderId: { $in: folderIds },
+      }).lean();
+
+      const hashes = [
+        ...new Set(assetsInFolders.map((asset) => asset.fileHash)),
+      ];
+      const blobs = await File.find({ _id: { $in: hashes } }).lean();
+      const blobByHash = new Map(blobs.map((blob) => [blob._id, blob]));
+
+      let totalFreedBytes = 0;
+      const blobsToDelete: string[] = [];
+
+      await withTransaction(async (session) => {
+        // Delete every claim in the subtree and release its blob reference.
+        for (const asset of assetsInFolders) {
+          const released = await releaseAsset(
+            session,
+            asset,
+            blobByHash.get(asset.fileHash)?.size ?? 0,
+          );
+          totalFreedBytes += released.freedBytes;
+          if (released.blobToDelete) blobsToDelete.push(released.blobToDelete);
         }
-        return ids;
+
+        // Delete all folders. No foreign keys, so order does not matter.
+        await Folder.deleteMany({ _id: { $in: folderIds } }, { session });
+
+        await adjustStorageUsed(userId, -totalFreedBytes, session);
+      });
+
+      for (const key of blobsToDelete) {
+        await s3.file(key).delete();
       }
 
-      const folderIds = await collectAllFolderIds(input.id);
-      let totalFreedBytes = 0;
-
-      // Get all files in these folders
-      const assetsInFolders = await db.query.userAssets.findMany({
-        where: and(
-          eq(userAssets.userId, userId),
-          sql`${userAssets.folderId} IN (${sql.join(folderIds.map(id => sql`${id}`), sql`, `)})`
-        ),
-        with: { file: true },
-      });
-
-      await db.transaction(async (tx) => {
-        // Delete all files and update reference counts
-        for (const asset of assetsInFolders) {
-          await tx.delete(userAssets).where(eq(userAssets.id, asset.id));
-
-          const [updatedFile] = await tx
-            .update(files)
-            .set({ refCount: sql`${files.refCount} - 1` })
-            .where(eq(files.hash, asset.fileHash))
-            .returning();
-
-          if (updatedFile && updatedFile.refCount <= 0) {
-            await s3.file(updatedFile.path).delete();
-            await tx.delete(files).where(eq(files.hash, asset.fileHash));
-          }
-
-          totalFreedBytes += asset.file.size;
-        }
-
-        // Delete all folders (children first, then parents)
-        for (const folderId of folderIds.reverse()) {
-          await tx.delete(folders).where(eq(folders.id, folderId));
-        }
-      });
-
-      // Update storage usage
-      await updateStorageUsage(userId, -totalFreedBytes);
-
-      return { 
-        success: true, 
+      return {
+        success: true,
         message: "Folder and contents permanently deleted",
         deletedFiles: assetsInFolders.length,
         deletedFolders: folderIds.length,
@@ -1089,82 +1080,60 @@ export const storageRouter = router({
    */
   emptyTrash: rateLimitedProcedure.mutation(async ({ ctx }) => {
     const userId = getUserId(ctx);
+    const userObjectId = toObjectId(userId);
 
     // Get all trashed assets
-    const trashedAssets = await db.query.userAssets.findMany({
-      where: and(
-        eq(userAssets.userId, userId),
-        isNotNull(userAssets.deletedAt)
-      ),
-      with: { file: true },
-    });
+    const trashedAssets = await Asset.find({
+      userId: userObjectId,
+      deletedAt: { $ne: null },
+    }).lean();
 
     // Get all trashed folders
-    const trashedFolders = await db.query.folders.findMany({
-      where: and(
-        eq(folders.userId, userId),
-        isNotNull(folders.deletedAt)
-      ),
-    });
+    const trashedFolders = await Folder.find({
+      userId: userObjectId,
+      deletedAt: { $ne: null },
+    }).lean();
 
     if (trashedAssets.length === 0 && trashedFolders.length === 0) {
-      return { 
-        success: true, 
-        deletedFiles: 0, 
-        deletedFolders: 0, 
-        message: "Trash is already empty" 
+      return {
+        success: true,
+        deletedFiles: 0,
+        deletedFolders: 0,
+        message: "Trash is already empty",
       };
     }
 
+    const hashes = [...new Set(trashedAssets.map((asset) => asset.fileHash))];
+    const blobs = await File.find({ _id: { $in: hashes } }).lean();
+    const blobByHash = new Map(blobs.map((blob) => [blob._id, blob]));
+
     let totalFreedBytes = 0;
+    const blobsToDelete: string[] = [];
 
-    await db.transaction(async (tx) => {
-      // Delete all trashed files
+    await withTransaction(async (session) => {
+      // Delete all trashed files.
       for (const asset of trashedAssets) {
-        await tx.delete(userAssets).where(eq(userAssets.id, asset.id));
-
-        const [updatedFile] = await tx
-          .update(files)
-          .set({ refCount: sql`${files.refCount} - 1` })
-          .where(eq(files.hash, asset.fileHash))
-          .returning();
-
-        if (updatedFile && updatedFile.refCount <= 0) {
-          await s3.file(updatedFile.path).delete();
-          await tx.delete(files).where(eq(files.hash, asset.fileHash));
-        }
-
-        totalFreedBytes += asset.file.size;
+        const released = await releaseAsset(
+          session,
+          asset,
+          blobByHash.get(asset.fileHash)?.size ?? 0,
+        );
+        totalFreedBytes += released.freedBytes;
+        if (released.blobToDelete) blobsToDelete.push(released.blobToDelete);
       }
 
-      // Delete all trashed folders (children first by sorting by depth)
-      // Sort by depth (deeper folders first) to avoid FK constraint issues
-      const folderDepths = new Map<string, number>();
-      
-      function calculateDepth(folderId: string, depth: number = 0): number {
-        const folder = trashedFolders.find(f => f.id === folderId);
-        if (!folder || !folder.parentId) return depth;
-        const parent = trashedFolders.find(f => f.id === folder.parentId);
-        if (!parent) return depth;
-        return calculateDepth(parent.id, depth + 1);
-      }
-
-      for (const folder of trashedFolders) {
-        folderDepths.set(folder.id, calculateDepth(folder.id));
-      }
-
-      // Sort by depth descending (deepest first)
-      const sortedFolders = [...trashedFolders].sort(
-        (a, b) => (folderDepths.get(b.id) ?? 0) - (folderDepths.get(a.id) ?? 0)
+      // Delete all trashed folders.
+      await Folder.deleteMany(
+        { _id: { $in: trashedFolders.map((folder) => folder._id) } },
+        { session },
       );
 
-      for (const folder of sortedFolders) {
-        await tx.delete(folders).where(eq(folders.id, folder.id));
-      }
+      await adjustStorageUsed(userId, -totalFreedBytes, session);
     });
 
-    // Update storage usage
-    await updateStorageUsage(userId, -totalFreedBytes);
+    for (const key of blobsToDelete) {
+      await s3.file(key).delete();
+    }
 
     return {
       success: true,
@@ -1182,18 +1151,18 @@ export const storageRouter = router({
   renameFile: rateLimitedProcedure
     .input(
       z.object({
-        id: z.string().uuid(),
+        id: objectIdSchema,
         name: filenameSchema,
-      })
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
 
-      const [updated] = await db
-        .update(userAssets)
-        .set({ name: input.name })
-        .where(and(eq(userAssets.id, input.id), eq(userAssets.userId, userId)))
-        .returning();
+      const updated = await Asset.findOneAndUpdate(
+        { _id: toObjectId(input.id), userId: toObjectId(userId) },
+        { name: input.name },
+        { returnDocument: "after" },
+      ).lean();
 
       if (!updated) {
         throw new TRPCError({
@@ -1202,7 +1171,7 @@ export const storageRouter = router({
         });
       }
 
-      return { success: true, asset: updated };
+      return { success: true, asset: serializeAsset(updated) };
     }),
 
   /**
@@ -1211,21 +1180,20 @@ export const storageRouter = router({
   moveFile: rateLimitedProcedure
     .input(
       z.object({
-        id: z.string().uuid(),
-        folderId: z.string().uuid().nullable(),
-      })
+        id: objectIdSchema,
+        folderId: objectIdSchema.nullable(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Verify target folder if specified
       if (input.folderId) {
-        const targetFolder = await db.query.folders.findFirst({
-          where: and(
-            eq(folders.id, input.folderId),
-            eq(folders.userId, userId)
-          ),
-        });
+        const targetFolder = await Folder.findOne({
+          _id: toObjectId(input.folderId),
+          userId: userObjectId,
+        }).lean();
         if (!targetFolder) {
           throw new TRPCError({
             code: "NOT_FOUND",
@@ -1234,11 +1202,15 @@ export const storageRouter = router({
         }
       }
 
-      const [updated] = await db
-        .update(userAssets)
-        .set({ folderId: input.folderId })
-        .where(and(eq(userAssets.id, input.id), eq(userAssets.userId, userId)))
-        .returning();
+      const updated = await Asset.findOneAndUpdate(
+        { _id: toObjectId(input.id), userId: userObjectId },
+        {
+          $set: {
+            folderId: input.folderId ? toObjectId(input.folderId) : null,
+          },
+        },
+        { returnDocument: "after" },
+      ).lean();
 
       if (!updated) {
         throw new TRPCError({
@@ -1256,22 +1228,23 @@ export const storageRouter = router({
   moveFiles: rateLimitedProcedure
     .input(
       z.object({
-        ids: z.array(z.string().uuid()).max(100, "Cannot move more than 100 files at once"),
-        folderId: z.string().uuid().nullable(),
-      })
+        ids: z
+          .array(objectIdSchema)
+          .max(100, "Cannot move more than 100 files at once"),
+        folderId: objectIdSchema.nullable(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Verify target folder if specified
       if (input.folderId) {
-        const targetFolder = await db.query.folders.findFirst({
-          where: and(
-            eq(folders.id, input.folderId),
-            eq(folders.userId, userId),
-            isNull(folders.deletedAt)
-          ),
-        });
+        const targetFolder = await Folder.findOne({
+          _id: toObjectId(input.folderId),
+          userId: userObjectId,
+          deletedAt: null,
+        }).lean();
         if (!targetFolder) {
           throw new TRPCError({
             code: "NOT_FOUND",
@@ -1280,18 +1253,19 @@ export const storageRouter = router({
         }
       }
 
-      // Move all files
-      let movedCount = 0;
-      for (const id of input.ids) {
-        const [updated] = await db
-          .update(userAssets)
-          .set({ folderId: input.folderId })
-          .where(and(eq(userAssets.id, id), eq(userAssets.userId, userId)))
-          .returning();
-        if (updated) movedCount++;
-      }
+      const result = await Asset.updateMany(
+        {
+          _id: { $in: input.ids.map((id) => toObjectId(id)) },
+          userId: userObjectId,
+        },
+        {
+          $set: {
+            folderId: input.folderId ? toObjectId(input.folderId) : null,
+          },
+        },
+      );
 
-      return { success: true, movedCount };
+      return { success: true, movedCount: result.modifiedCount };
     }),
 
   /**
@@ -1300,21 +1274,20 @@ export const storageRouter = router({
   moveFolder: rateLimitedProcedure
     .input(
       z.object({
-        id: z.string().uuid(),
-        parentId: z.string().uuid().nullable(),
-      })
+        id: objectIdSchema,
+        parentId: objectIdSchema.nullable(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Get the folder being moved
-      const folder = await db.query.folders.findFirst({
-        where: and(
-          eq(folders.id, input.id),
-          eq(folders.userId, userId),
-          isNull(folders.deletedAt)
-        ),
-      });
+      const folder = await Folder.findOne({
+        _id: toObjectId(input.id),
+        userId: userObjectId,
+        deletedAt: null,
+      }).lean();
 
       if (!folder) {
         throw new TRPCError({
@@ -1333,13 +1306,11 @@ export const storageRouter = router({
 
       // Verify target folder if specified
       if (input.parentId) {
-        const targetFolder = await db.query.folders.findFirst({
-          where: and(
-            eq(folders.id, input.parentId),
-            eq(folders.userId, userId),
-            isNull(folders.deletedAt)
-          ),
-        });
+        const targetFolder = await Folder.findOne({
+          _id: toObjectId(input.parentId),
+          userId: userObjectId,
+          deletedAt: null,
+        }).lean();
         if (!targetFolder) {
           throw new TRPCError({
             code: "NOT_FOUND",
@@ -1347,16 +1318,7 @@ export const storageRouter = router({
           });
         }
 
-        // Check for circular reference - target cannot be a child of the folder being moved
-        async function isDescendant(ancestorId: string, checkId: string): Promise<boolean> {
-          const checkFolder = await db.query.folders.findFirst({
-            where: eq(folders.id, checkId),
-          });
-          if (!checkFolder || !checkFolder.parentId) return false;
-          if (checkFolder.parentId === ancestorId) return true;
-          return isDescendant(ancestorId, checkFolder.parentId);
-        }
-
+        // Check for circular reference - target cannot be a descendant.
         if (await isDescendant(input.id, input.parentId)) {
           throw new TRPCError({
             code: "BAD_REQUEST",
@@ -1365,13 +1327,13 @@ export const storageRouter = router({
         }
       }
 
-      const [updated] = await db
-        .update(folders)
-        .set({ parentId: input.parentId })
-        .where(eq(folders.id, input.id))
-        .returning();
+      const updated = await Folder.findOneAndUpdate(
+        { _id: folder._id },
+        { $set: { parentId: input.parentId ? toObjectId(input.parentId) : null } },
+        { returnDocument: "after" },
+      ).lean();
 
-      return { success: true, folder: updated };
+      return { success: true, folder: updated ? serializeFolder(updated) : null };
     }),
 
   /**
@@ -1380,22 +1342,23 @@ export const storageRouter = router({
   moveFolders: rateLimitedProcedure
     .input(
       z.object({
-        ids: z.array(z.string().uuid()).max(100, "Cannot move more than 100 folders at once"),
-        parentId: z.string().uuid().nullable(),
-      })
+        ids: z
+          .array(objectIdSchema)
+          .max(100, "Cannot move more than 100 folders at once"),
+        parentId: objectIdSchema.nullable(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
+      const userObjectId = toObjectId(userId);
 
       // Verify target folder if specified
       if (input.parentId) {
-        const targetFolder = await db.query.folders.findFirst({
-          where: and(
-            eq(folders.id, input.parentId),
-            eq(folders.userId, userId),
-            isNull(folders.deletedAt)
-          ),
-        });
+        const targetFolder = await Folder.findOne({
+          _id: toObjectId(input.parentId),
+          userId: userObjectId,
+          deletedAt: null,
+        }).lean();
         if (!targetFolder) {
           throw new TRPCError({
             code: "NOT_FOUND",
@@ -1404,37 +1367,29 @@ export const storageRouter = router({
         }
       }
 
-      // Helper to check circular reference
-      async function isDescendant(ancestorId: string, checkId: string): Promise<boolean> {
-        const checkFolder = await db.query.folders.findFirst({
-          where: eq(folders.id, checkId),
-        });
-        if (!checkFolder || !checkFolder.parentId) return false;
-        if (checkFolder.parentId === ancestorId) return true;
-        return isDescendant(ancestorId, checkFolder.parentId);
-      }
-
       let movedCount = 0;
       for (const id of input.ids) {
         // Skip if trying to move to itself
         if (input.parentId === id) continue;
 
         // Skip if target is a descendant of this folder
-        if (input.parentId && await isDescendant(id, input.parentId)) continue;
+        if (input.parentId && (await isDescendant(id, input.parentId))) continue;
 
-        const folder = await db.query.folders.findFirst({
-          where: and(
-            eq(folders.id, id),
-            eq(folders.userId, userId),
-            isNull(folders.deletedAt)
-          ),
-        });
+        const folder = await Folder.findOne({
+          _id: toObjectId(id),
+          userId: userObjectId,
+          deletedAt: null,
+        }).lean();
 
         if (folder) {
-          await db
-            .update(folders)
-            .set({ parentId: input.parentId })
-            .where(eq(folders.id, id));
+          await Folder.updateOne(
+            { _id: folder._id },
+            {
+              $set: {
+                parentId: input.parentId ? toObjectId(input.parentId) : null,
+              },
+            },
+          );
           movedCount++;
         }
       }
@@ -1452,9 +1407,9 @@ export const storageRouter = router({
   togglePublic: rateLimitedProcedure
     .input(
       z.object({
-        id: z.string().uuid(),
+        id: objectIdSchema,
         isPublic: z.boolean(),
-      })
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
@@ -1462,14 +1417,16 @@ export const storageRouter = router({
       // Generate or clear share ID
       const publicShareId = input.isPublic ? crypto.randomUUID() : null;
 
-      const [updated] = await db
-        .update(userAssets)
-        .set({
-          isPublic: input.isPublic,
-          publicShareId,
-        })
-        .where(and(eq(userAssets.id, input.id), eq(userAssets.userId, userId)))
-        .returning();
+      const updated = await Asset.findOneAndUpdate(
+        { _id: toObjectId(input.id), userId: toObjectId(userId) },
+        {
+          $set: {
+            isPublic: input.isPublic,
+            publicShareId,
+          },
+        },
+        { returnDocument: "after" },
+      ).lean();
 
       if (!updated) {
         throw new TRPCError({
@@ -1494,13 +1451,10 @@ export const storageRouter = router({
   getPublicFile: publicProcedure
     .input(z.object({ shareId: z.string().uuid() }))
     .query(async ({ input }) => {
-      const asset = await db.query.userAssets.findFirst({
-        where: and(
-          eq(userAssets.publicShareId, input.shareId),
-          eq(userAssets.isPublic, true)
-        ),
-        with: { file: true },
-      });
+      const asset = await Asset.findOne({
+        publicShareId: input.shareId,
+        isPublic: true,
+      }).lean();
 
       if (!asset) {
         throw new TRPCError({
@@ -1509,21 +1463,29 @@ export const storageRouter = router({
         });
       }
 
+      const blob = await File.findById(asset.fileHash).lean();
+      if (!blob) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "File content not found",
+        });
+      }
+
       // Increment download count
-      await db
-        .update(userAssets)
-        .set({ downloadCount: sql`${userAssets.downloadCount} + 1` })
-        .where(eq(userAssets.id, asset.id));
+      await Asset.updateOne(
+        { _id: asset._id },
+        { $inc: { downloadCount: 1 } },
+      );
 
       // Generate download URL
-      const downloadUrl = s3.presign(asset.file.path, {
+      const downloadUrl = s3.presign(blob.path, {
         expiresIn: 3600,
       });
 
       return {
-        id: asset.id,
+        id: String(asset._id),
         name: asset.name,
-        size: asset.file.size,
+        size: blob.size,
         contentType: asset.contentType,
         downloadCount: asset.downloadCount + 1, // Include current download
         uploadDate: asset.createdAt,
@@ -1537,49 +1499,69 @@ export const storageRouter = router({
 
   /**
    * Get storage statistics for the current user
+   *
+   * One aggregation pipeline computes logical size, file counts, and the
+   * deduplicated (physical) size in a single round trip using `$facet`:
+   *  - `totals` sums every asset's blob size (what the user uploaded);
+   *  - `unique` collapses assets by hash first, so each unique blob is counted
+   *    once (what the dedup actually costs).
    */
-  getStats: rateLimitedProcedure.query(async ({ ctx }) => {
+  getStats: protectedProcedure.query(async ({ ctx }) => {
     const userId = getUserId(ctx);
+    const userObjectId = toObjectId(userId);
 
-    // Get user quota info
-    const quota = await db.query.userQuotas.findFirst({
-      where: eq(userQuotas.userId, userId),
-    });
+    const quota = await readQuota(userObjectId);
 
-    // Calculate total original size (what user uploaded)
-    const [originalStats] = await db
-      .select({
-        totalOriginalSize: sql<number>`COALESCE(SUM(${files.size}), 0)`,
-        fileCount: count(),
-      })
-      .from(userAssets)
-      .innerJoin(files, eq(userAssets.fileHash, files.hash))
-      .where(eq(userAssets.userId, userId));
+    const [result] = await Asset.aggregate<{
+      totals: {
+        originalSize: number;
+        totalFiles: number;
+        dedupedFiles: number;
+      }[];
+      unique: { uniqueSize: number }[];
+    }>([
+      { $match: { userId: userObjectId } },
+      {
+        $lookup: {
+          from: "files",
+          localField: "fileHash",
+          foreignField: "_id",
+          as: "file",
+        },
+      },
+      { $unwind: "$file" },
+      {
+        $facet: {
+          totals: [
+            {
+              $group: {
+                _id: null,
+                originalSize: { $sum: "$file.size" },
+                totalFiles: { $sum: 1 },
+                dedupedFiles: {
+                  $sum: { $cond: [{ $gt: ["$file.refCount", 1] }, 1, 0] },
+                },
+              },
+            },
+          ],
+          unique: [
+            {
+              $group: {
+                _id: "$fileHash",
+                size: { $first: "$file.size" },
+              },
+            },
+            { $group: { _id: null, uniqueSize: { $sum: "$size" } } },
+          ],
+        },
+      },
+    ]);
 
-    // Calculate actual unique storage used (considering deduplication)
-    // This counts each unique file only once regardless of references
-    const [uniqueStats] = await db
-      .select({
-        uniqueSize: sql<number>`COALESCE(SUM(DISTINCT ${files.size}), 0)`,
-      })
-      .from(userAssets)
-      .innerJoin(files, eq(userAssets.fileHash, files.hash))
-      .where(eq(userAssets.userId, userId));
-
-    // Get deduplication stats per file
-    const [dedupStats] = await db
-      .select({
-        dedupedFiles: sql<number>`COUNT(CASE WHEN ${files.refCount} > 1 THEN 1 END)`,
-        savedBytes: sql<number>`COALESCE(SUM(CASE WHEN ${files.refCount} > 1 THEN ${files.size} ELSE 0 END), 0)`,
-      })
-      .from(userAssets)
-      .innerJoin(files, eq(userAssets.fileHash, files.hash))
-      .where(eq(userAssets.userId, userId));
-
-    const storageUsed = quota?.storageUsed ?? 0;
-    const storageLimit = quota?.storageLimit ?? DEFAULT_STORAGE_LIMIT;
-    const totalOriginalSize = Number(originalStats?.totalOriginalSize ?? 0);
-    const actualStorageUsed = Number(uniqueStats?.uniqueSize ?? 0);
+    const totals = result?.totals?.[0];
+    const storageUsed = quota.storageUsed;
+    const storageLimit = quota.storageLimit;
+    const totalOriginalSize = Number(totals?.originalSize ?? 0);
+    const actualStorageUsed = Number(result?.unique?.[0]?.uniqueSize ?? 0);
     const savedBytes = totalOriginalSize - actualStorageUsed;
     const savedPercent =
       totalOriginalSize > 0 ? (savedBytes / totalOriginalSize) * 100 : 0;
@@ -1593,8 +1575,8 @@ export const storageRouter = router({
       usagePercent: (storageUsed / storageLimit) * 100,
 
       // File counts
-      totalFiles: Number(originalStats?.fileCount ?? 0),
-      dedupedFiles: Number(dedupStats?.dedupedFiles ?? 0),
+      totalFiles: Number(totals?.totalFiles ?? 0),
+      dedupedFiles: Number(totals?.dedupedFiles ?? 0),
 
       // Deduplication savings
       originalSize: totalOriginalSize,
@@ -1606,48 +1588,17 @@ export const storageRouter = router({
       savedBytesFormatted: formatBytes(savedBytes),
 
       // Rate limit
-      rateLimit: quota?.rateLimit ?? DEFAULT_RATE_LIMIT,
+      rateLimit: quota.rateLimit ?? DEFAULT_RATE_LIMIT,
     };
   }),
 
   /**
    * Get quota settings (admin use or display)
    */
-  getQuota: rateLimitedProcedure.query(async ({ ctx }) => {
+  getQuota: protectedProcedure.query(async ({ ctx }) => {
     const userId = getUserId(ctx);
 
-    let quota = await db.query.userQuotas.findFirst({
-      where: eq(userQuotas.userId, userId),
-    });
-
-    if (!quota) {
-      // Create default quota
-      const [newQuota] = await db
-        .insert(userQuotas)
-        .values({
-          userId,
-          storageUsed: 0,
-          storageLimit: DEFAULT_STORAGE_LIMIT,
-          rateLimit: DEFAULT_RATE_LIMIT,
-        })
-        .returning();
-
-      if (!newQuota) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Failed to create user quota",
-        });
-      }
-
-      return {
-        storageUsed: newQuota.storageUsed,
-        storageLimit: newQuota.storageLimit,
-        storageUsedFormatted: formatBytes(newQuota.storageUsed),
-        storageLimitFormatted: formatBytes(newQuota.storageLimit),
-        usagePercent: (newQuota.storageUsed / newQuota.storageLimit) * 100,
-        rateLimit: newQuota.rateLimit,
-      };
-    }
+    const quota = await ensureQuota(toObjectId(userId));
 
     return {
       storageUsed: quota.storageUsed,
@@ -1655,7 +1606,7 @@ export const storageRouter = router({
       storageUsedFormatted: formatBytes(quota.storageUsed),
       storageLimitFormatted: formatBytes(quota.storageLimit),
       usagePercent: (quota.storageUsed / quota.storageLimit) * 100,
-      rateLimit: quota.rateLimit,
+      rateLimit: quota.rateLimit ?? DEFAULT_RATE_LIMIT,
     };
   }),
 
@@ -1671,7 +1622,7 @@ export const storageRouter = router({
     .input(
       z.object({
         contentType: z.string().regex(/^image\/(jpeg|png|gif|webp)$/),
-      })
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       const userId = getUserId(ctx);
@@ -1698,7 +1649,10 @@ export const storageRouter = router({
     const userId = getUserId(ctx);
     const key = `avatars/${userId}`;
 
-      // Check if avatar exists
+    // The avatar is optional and object storage may be unreachable or not yet
+    // configured. A missing avatar must never break the dashboard, so any
+    // storage error degrades to "no avatar".
+    try {
       const exists = await s3.file(key).exists();
       if (!exists) {
         return { avatarUrl: null };
@@ -1710,5 +1664,8 @@ export const storageRouter = router({
       });
 
       return { avatarUrl };
-    }),
+    } catch {
+      return { avatarUrl: null };
+    }
+  }),
 });

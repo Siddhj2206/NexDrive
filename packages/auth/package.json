@@ -1,5 +1,5 @@
 {
-  "name": "@Vinnodrive/auth",
+  "name": "@nexdrive/auth",
   "type": "module",
   "exports": {
     ".": {
@@ -9,15 +9,18 @@
       "default": "./src/*.ts"
     }
   },
-  "scripts": {},
+  "scripts": {
+    "check-types": "tsc -b"
+  },
   "devDependencies": {
     "typescript": "catalog:",
-    "@Vinnodrive/config": "workspace:*"
+    "@nexdrive/config": "workspace:*"
   },
   "dependencies": {
     "better-auth": "catalog:",
     "dotenv": "catalog:",
+    "mongodb": "catalog:",
     "zod": "catalog:",
-    "@Vinnodrive/db": "workspace:*"
+    "@nexdrive/db": "workspace:*"
   }
 }

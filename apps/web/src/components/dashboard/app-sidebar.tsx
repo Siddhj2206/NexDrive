@@ -1,5 +1,6 @@
 import { Link, useLocation } from "@tanstack/react-router";
 import {
+  BarChart3,
   ChevronRight,
   Files,
   Folder,
@@ -83,7 +84,7 @@ export function AppSidebar({
                     <HardDrive className="size-4" />
                   </div>
                   <div className="grid flex-1 text-left text-sm leading-tight">
-                    <span className="truncate font-semibold">VinnoDrive</span>
+                    <span className="truncate font-semibold">NexDrive</span>
                   </div>
                 </Link>
               </SidebarMenuButton>
@@ -170,6 +171,18 @@ export function AppSidebar({
                     <Link to="/dashboard/shared">
                       <Share2 />
                       <span>Shared</span>
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    tooltip="Insights"
+                    isActive={pathname === "/dashboard/insights"}
+                  >
+                    <Link to="/dashboard/insights">
+                      <BarChart3 />
+                      <span>Insights</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

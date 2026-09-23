@@ -29,7 +29,7 @@ async function createTestUser() {
 }
 
 async function runTests() {
-  console.log("\n=== VinnoDrive Backend Tests ===\n");
+  console.log("\n=== NexDrive Backend Tests ===\n");
 
   // Step 1: Create test user
   console.log("1. Creating test user...");
@@ -87,7 +87,7 @@ async function runTests() {
 
   // Step 8: Test file upload flow
   console.log("\n8. Testing file upload flow...");
-  const testContent = "Hello, VinnoDrive! This is a test file.";
+  const testContent = "Hello, NexDrive! This is a test file.";
   const testBuffer = Buffer.from(testContent);
   const hash = new Bun.CryptoHasher("sha256").update(testBuffer).digest("hex");
 
@@ -184,8 +184,11 @@ async function runTests() {
   console.log("\n13. Testing rate limiting...");
   let rateLimitHit = false;
   try {
-    // Fire many requests quickly
-    const promises = Array(10).fill(null).map(() => client.storage.getStats.query());
+    // Fire many mutations quickly. Reads are not rate-limited, so the limiter is
+    // exercised with writes.
+    const promises = Array(10)
+      .fill(null)
+      .map((_, i) => client.storage.createFolder.mutate({ name: `burst-${i}` }));
     await Promise.all(promises);
   } catch (e: any) {
     if (e.message?.includes("Rate limit")) {

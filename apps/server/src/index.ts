@@ -1,9 +1,10 @@
 import "dotenv/config";
 import { trpcServer } from "@hono/trpc-server";
-import { createContext } from "@Vinnodrive/api/context";
-import { getEnv } from "@Vinnodrive/api/env";
-import { appRouter } from "@Vinnodrive/api/routers/index";
-import { auth } from "@Vinnodrive/auth";
+import { connectDB } from "@nexdrive/db";
+import { createContext } from "@nexdrive/api/context";
+import { getEnv } from "@nexdrive/api/env";
+import { appRouter } from "@nexdrive/api/routers/index";
+import { getAuth } from "@nexdrive/auth";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
@@ -11,6 +12,11 @@ import { logger } from "hono/logger";
 // Validate environment variables at startup - will throw if missing/invalid
 const env = getEnv();
 
+// Establish the MongoDB connection before serving anything. The router's
+// models and Better Auth's adapter both read from this shared connection.
+await connectDB(env.MONGODB_URI);
+
+const auth = getAuth();
 const app = new Hono();
 
 app.use(logger());

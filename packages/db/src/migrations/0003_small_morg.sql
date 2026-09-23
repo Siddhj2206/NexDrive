@@ -1,1 +1,0 @@
-ALTER TABLE "user_assets" ADD COLUMN "content_type" text;

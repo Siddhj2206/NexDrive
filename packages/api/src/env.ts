@@ -6,7 +6,9 @@ import { z } from "zod";
  */
 const envSchema = z.object({
   // Database
-  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  MONGODB_URI: z
+    .string()
+    .regex(/^mongodb(\+srv)?:\/\//, "MONGODB_URI must be a mongodb:// URL"),
 
   // Authentication
   BETTER_AUTH_SECRET: z

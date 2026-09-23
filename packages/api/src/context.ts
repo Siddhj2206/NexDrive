@@ -1,13 +1,13 @@
 import type { Context as HonoContext } from "hono";
 
-import { auth } from "@Vinnodrive/auth";
+import { getAuth } from "@nexdrive/auth";
 
 export type CreateContextOptions = {
   context: HonoContext;
 };
 
 export async function createContext({ context }: CreateContextOptions) {
-  const session = await auth.api.getSession({
+  const session = await getAuth().api.getSession({
     headers: context.req.raw.headers,
   });
   return {

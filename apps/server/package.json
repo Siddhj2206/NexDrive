@@ -12,18 +12,18 @@
   "dependencies": {
     "hono": "catalog:",
     "@trpc/server": "catalog:",
-    "@hono/trpc-server": "^0.4.0",
+    "@hono/trpc-server": "^0.4.2",
     "better-auth": "catalog:",
     "dotenv": "catalog:",
     "zod": "catalog:",
-    "@Vinnodrive/api": "workspace:*",
-    "@Vinnodrive/auth": "workspace:*",
-    "@Vinnodrive/db": "workspace:*"
+    "@nexdrive/api": "workspace:*",
+    "@nexdrive/auth": "workspace:*",
+    "@nexdrive/db": "workspace:*"
   },
   "devDependencies": {
     "@types/bun": "catalog:",
     "typescript": "catalog:",
-    "tsdown": "^0.16.5",
-    "@Vinnodrive/config": "workspace:*"
+    "tsdown": "^0.23.0",
+    "@nexdrive/config": "workspace:*"
   }
 }

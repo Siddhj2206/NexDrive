@@ -1,17 +1,22 @@
-# VinnoDrive
+# NexDrive
 
-A modern, self-hosted cloud storage platform with smart file deduplication, secure sharing, and real-time storage accounting. Built with the Better-T-Stack.
+A self-hosted cloud storage platform with smart, content-addressed deduplication. Built on MongoDB, with a React front end and a Hono + tRPC API.
+
+Every file is identified by the SHA-256 hash of its content, stored once, and shared across users. If 100 users upload the same 1 GB file, it costs 1 GB — not 100 GB.
+
+> **BCSE302P — Database Systems Lab project.** Review 1 (problem definition, requirement analysis, database design) is in [`docs/review-1.md`](docs/review-1.md).
 
 ## Features
 
-- **File Storage & Management** - Upload, organize, and manage files in a folder hierarchy
-- **Smart Deduplication** - Files are stored once and referenced multiple times, saving storage space
-- **File Preview** - In-app preview for images, videos, audio, PDFs, and text files
-- **Secure Sharing** - Generate public share links with download tracking
-- **Trash & Recovery** - Soft delete with restore capability
-- **Storage Quotas** - Per-user storage limits with real-time usage tracking
-- **Rate Limiting** - Built-in API rate limiting per user
-- **Profile Avatars** - Upload and manage user profile photos
+- **Content-addressed deduplication** — a blob is stored once and referenced by any number of users; `refCount` tracks the claims.
+- **Hierarchical folders** — create, rename, move (single and bulk), and delete; recursive trash and restore.
+- **Trash** — soft delete for files and folders, restore, permanent delete, and empty-trash. A blob leaves object storage only when its last reference is gone.
+- **Storage quotas** — per-user logical byte accounting, embedded in the user document and updated atomically with `$inc`.
+- **Deduplication statistics** — an aggregation pipeline reports logical vs physical size and savings.
+- **Public share links** — unguessable share IDs with download counting.
+- **Per-user rate limiting** — one document per second window, expired automatically by a TTL index.
+- **In-app preview** — images, video, audio, PDF, and text.
+- **Profile avatars.**
 
 ## Tech Stack
 
@@ -22,37 +27,36 @@ A modern, self-hosted cloud storage platform with smart file deduplication, secu
 | Styling | TailwindCSS, [shadcn/ui](https://ui.shadcn.com) |
 | Backend | [Hono](https://hono.dev) |
 | API | [tRPC](https://trpc.io) (end-to-end type safety) |
-| Database | PostgreSQL, [Drizzle ORM](https://orm.drizzle.team) |
-| Auth | [Better Auth](https://better-auth.com) |
+| Database | **MongoDB**, [Mongoose](https://mongoosejs.com) |
+| Auth | [Better Auth](https://better-auth.com) (MongoDB adapter) |
 | Storage | Cloudflare R2 (S3-compatible) |
 | Monorepo | [Turborepo](https://turbo.build) |
 
 ## Project Structure
 
 ```
-Vinnodrive/
+NexDrive/
 ├── apps/
-│   ├── web/             # Frontend (React + TanStack Router)
-│   │   ├── src/
-│   │   │   ├── components/   # UI components
-│   │   │   ├── routes/       # File-based routing
-│   │   │   ├── hooks/        # Custom React hooks
-│   │   │   └── utils/        # Utilities (tRPC client, etc.)
-│   │   └── ...
-│   └── server/          # Backend API (Hono + tRPC)
-│       └── src/
-│           └── index.ts
+│   ├── web/                 # Frontend (React + TanStack Router)
+│   └── server/              # Backend API (Hono + tRPC)
 ├── packages/
-│   ├── api/             # tRPC routers & business logic
+│   ├── api/                 # tRPC routers & business logic
 │   │   └── src/routers/
-│   │       ├── storage/     # File/folder operations
-│   │       └── todo.ts      # Example CRUD
-│   ├── auth/            # Authentication configuration
-│   ├── db/              # Database schema & migrations
+│   │       └── storage/     # File/folder operations
+│   ├── auth/                # Better Auth configuration (MongoDB adapter)
+│   ├── db/                  # MongoDB connection, Mongoose models, seed
 │   │   └── src/
-│   │       ├── schema/      # Drizzle table definitions
-│   │       └── migrations/  # SQL migrations
-│   └── config/          # Shared TypeScript config
+│   │       ├── connection.ts
+│   │       ├── models/      # user, file, folder, asset, rate-limit-window
+│   │       ├── quota.ts
+│   │       ├── indexes.ts
+│   │       └── seed.ts
+│   └── config/              # Shared TypeScript config
+├── scripts/
+│   ├── mongo.sh             # podman-managed MongoDB replica set
+│   ├── smoke.ts             # API smoke test (no object storage needed)
+│   └── verify-seed.ts       # logs in as the demo user and reads stats
+└── docs/
 ```
 
 ## Getting Started
@@ -60,77 +64,79 @@ Vinnodrive/
 ### Prerequisites
 
 - [Bun](https://bun.sh) v1.3.5+
-- PostgreSQL database
-- Cloudflare R2 bucket (or any S3-compatible storage)
+- [podman](https://podman.io) (for the local MongoDB replica set)
+- A Cloudflare R2 bucket (or any S3-compatible storage)
 
-### Installation
+### 1. Install dependencies
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd Vinnodrive
-   ```
+```bash
+bun install
+```
 
-2. **Install dependencies**
-   ```bash
-   bun install
-   ```
+### 2. Start MongoDB
 
-3. **Configure environment variables**
+A **single-node replica set** named `rs0`, managed by podman. The replica set is required for multi-document transactions — the dedup ref-counting and quota flows depend on them.
 
-   Copy the example files and fill in your values:
-   ```bash
-   cp apps/server/.env.example apps/server/.env
-   cp apps/web/.env.example apps/web/.env
-   ```
+```bash
+bun run db:up        # create + start the container, initiate the replica set
+bun run db:status    # show container and replica set state
+bun run db:down      # stop and remove the container (volume kept)
+bun run db:reset     # down, wipe the volume, up again
+```
 
-   **Server environment (`apps/server/.env`):**
-   ```env
-   # Authentication
-   BETTER_AUTH_SECRET=your-secret-key-min-32-chars
-   BETTER_AUTH_URL=http://localhost:3000
+Connection string: `mongodb://localhost:27017/nexdrive?replicaSet=rs0`
 
-   # CORS
-   CORS_ORIGIN=http://localhost:3001
+### 3. Configure environment
 
-   # Database
-   DATABASE_URL=postgresql://user:password@localhost:5432/vinnodrive
+```bash
+cp apps/server/.env.example apps/server/.env
+cp apps/web/.env.example apps/web/.env
+```
 
-   # Cloudflare R2 Storage
-   R2_ACCESS_KEY_ID=your-r2-access-key
-   R2_SECRET_ACCESS_KEY=your-r2-secret-key
-   R2_BUCKET_NAME=vinnodrive
-   R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+**Server environment (`apps/server/.env`):**
 
-   # Optional: Override defaults
-   # STORAGE_LIMIT_BYTES=10737418240  # 10GB default per user
-   # RATE_LIMIT_PER_SECOND=2
-   ```
+```env
+# Database
+MONGODB_URI="mongodb://localhost:27017/nexdrive?replicaSet=rs0"
 
-   **Web environment (`apps/web/.env`):**
-   ```env
-   VITE_SERVER_URL=http://localhost:3000
-   ```
+# Authentication
+BETTER_AUTH_SECRET=your-secret-key-min-32-chars
+BETTER_AUTH_URL=http://localhost:3000
 
-4. **Set up the database**
+# CORS
+CORS_ORIGIN=http://localhost:3001
 
-   Push the schema to your database:
-   ```bash
-   bun run db:push
-   ```
+# Cloudflare R2 Storage
+R2_ACCESS_KEY_ID=your-r2-access-key
+R2_SECRET_ACCESS_KEY=your-r2-secret-key
+R2_BUCKET_NAME=nexdrive
+R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+```
 
-   Or run migrations for production:
-   ```bash
-   bun run db:migrate
-   ```
+**Web environment (`apps/web/.env`):**
 
-5. **Start the development server**
-   ```bash
-   bun run dev
-   ```
+```env
+VITE_SERVER_URL=http://localhost:3000
+```
 
-   - Web app: http://localhost:3001
-   - API server: http://localhost:3000
+### 4. Load the sample dataset
+
+```bash
+bun run db:seed
+```
+
+This clears the collections and loads 100+ documents: 6 users, their credential accounts, nested folders, 30 unique blobs, 57 asset claims (many deduplicated), trashed items, and public shares.
+
+Demo login: **`alice@nexdrive.test` / `password123`** (all seeded users share this password).
+
+### 5. Run
+
+```bash
+bun run dev
+```
+
+- Web app: http://localhost:3001
+- API server: http://localhost:3000
 
 ## Available Scripts
 
@@ -140,109 +146,86 @@ Vinnodrive/
 | `bun run build` | Build all apps for production |
 | `bun run dev:web` | Start only the web frontend |
 | `bun run dev:server` | Start only the API server |
-| `bun run check-types` | TypeScript type checking |
-| `bun run db:push` | Push schema changes to database |
-| `bun run db:generate` | Generate migration files |
-| `bun run db:migrate` | Run pending migrations |
-| `bun run db:studio` | Open Drizzle Studio (database GUI) |
+| `bun run check-types` | TypeScript type checking across every package |
+| `bun run db:up` / `db:down` / `db:status` / `db:reset` | Manage the MongoDB container |
+| `bun run db:seed` | Load the sample dataset |
+| `bun run scripts/smoke.ts` | API smoke test (auth, folders, trash, stats) |
+| `bun run scripts/verify-seed.ts` | Sign in as the demo user and read stats |
+| `bun run scripts/analytics-report.ts` | Print every analytics aggregation |
 
-## Database Schema
+## Database Design
 
-### Core Tables
+### Collections
 
-- **`files`** - Deduplicated file storage (keyed by SHA-256 hash)
-- **`user_assets`** - User's files with metadata, folder assignment, sharing settings
-- **`folders`** - Hierarchical folder structure per user
-- **`user_quotas`** - Storage limits and usage per user
-- **`rate_limit_windows`** - API rate limiting tracking
+| Collection | Purpose | Notes |
+|------------|---------|-------|
+| `user` | Profile with embedded `quota` | Owned by Better Auth; quota updated with `$inc` |
+| `session`, `account`, `verification` | Auth records | Managed by Better Auth's MongoDB adapter |
+| `files` | Content-addressable blob registry | `_id` **is** the SHA-256 hash |
+| `folders` | Adjacency-list folder tree | `parentId` reference, `deletedAt` for trash |
+| `assets` | One document per user-file claim | Owns name, folder, sharing, trash state |
+| `rate_limit_windows` | Ephemeral rate-limit counters | Self-expiring via a TTL index |
 
-### Deduplication Strategy
+### Deduplication
 
-Files are stored once in R2, identified by their SHA-256 content hash. When multiple users upload the same file:
-1. The hash is computed client-side
-2. Server checks if hash exists in `files` table
-3. If exists, increment `refCount` and link to user
-4. If not, upload to R2 and create new `files` record
+1. The client computes the SHA-256 hash before upload.
+2. The server does one point-read: `File.findById(hash)`.
+3. If the hash exists, no content is re-uploaded — a new `asset` is created and `files.refCount` is incremented.
+4. If not, the content is uploaded to R2 and a new `files` document is created.
 
-This means 100 users uploading the same 1GB file only uses 1GB of storage.
+Upload commit, dedup hit, delete, trash/restore, and empty-trash all run inside **multi-document transactions**, so ref-counts and quota deltas never tear.
 
-## API Routes
+### Indexes
 
-All API routes are defined in `packages/api/src/routers/`. Key storage operations:
+Beyond the default `_id` indexes:
 
-| Procedure | Description |
-|-----------|-------------|
-| `storage.getUploadPresignedUrl` | Get presigned URL for direct upload to R2 |
-| `storage.confirmUpload` | Confirm upload and create asset record |
-| `storage.listFiles` | List files in a folder |
-| `storage.getFile` | Get file details with download URL |
-| `storage.deleteFile` | Soft delete (move to trash) |
-| `storage.restoreFile` | Restore from trash |
-| `storage.permanentlyDeleteFile` | Permanent deletion |
-| `storage.createFolder` | Create new folder |
-| `storage.moveFile` | Move file to different folder |
-| `storage.createShareLink` | Generate public share link |
-| `storage.getPublicFile` | Access shared file (no auth required) |
+- `files.refCount`
+- `folders`: `{userId, parentId, deletedAt}`, `{userId, deletedAt}`, `{parentId}`
+- `assets`: `{userId, folderId, deletedAt}`, `{userId, deletedAt, createdAt}`, `{userId, fileHash}`, and a **partial unique** index on `publicShareId`
+- `rate_limit_windows`: unique `{userId, windowStart}` and a **TTL** index on `createdAt` (60 s)
 
 ## Cloudflare R2 Setup
 
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com) > R2
-2. Create a new bucket (e.g., `vinnodrive`)
-3. Go to **Manage R2 API Tokens** > Create API Token
-4. Give it **Object Read & Write** permissions for your bucket
-5. Copy the Access Key ID and Secret Access Key
-6. Your endpoint is: `https://<account-id>.r2.cloudflarestorage.com`
+1. Go to Cloudflare Dashboard > R2.
+2. Create a new bucket (e.g., `nexdrive`).
+3. **Manage R2 API Tokens** > Create API Token with **Object Read & Write**.
+4. Copy the Access Key ID and Secret Access Key.
+5. Endpoint: `https://<account-id>.r2.cloudflarestorage.com`.
 
-**Note:** The bucket should NOT be public. All access is via presigned URLs generated by the server.
+The bucket stays private. Uploads go directly from the browser via short-lived presigned `PUT` URLs; downloads use presigned `GET` URLs.
 
-## Production Deployment
+## API Routes
 
-1. **Build the applications**
-   ```bash
-   bun run build
-   ```
+All routes live in `packages/api/src/routers/storage/storage.ts`.
 
-2. **Set production environment variables**
-   - Use strong `BETTER_AUTH_SECRET` (32+ random characters)
-   - Set correct `BETTER_AUTH_URL` and `CORS_ORIGIN` for your domain
-   - Use production database URL
+| Procedure | Description |
+|-----------|-------------|
+| `storage.getUploadPresignedUrl` | Presigned URL for upload, with dedup check |
+| `storage.confirmUpload` | Confirm upload and create the asset |
+| `storage.listFiles` | List files and subfolders |
+| `storage.getFile` | File details with a download URL |
+| `storage.deleteAsset` | Delete an asset (ref-counted) |
+| `storage.moveToTrash` / `restoreFromTrash` | Soft delete and restore |
+| `storage.permanentlyDelete` | Permanent deletion |
+| `storage.createFolder` / `renameFolder` / `moveFolder` / `deleteFolder` | Folder management |
+| `storage.togglePublic` | Toggle a public share link |
+| `storage.getPublicFile` | Access a shared file (no auth) |
+| `storage.getStats` / `getQuota` | Storage statistics and quota |
+| `storage.getAvatarUploadUrl` / `getAvatarUrl` | Profile avatars |
 
-3. **Run migrations**
-   ```bash
-   bun run db:migrate
-   ```
+### Analytics (`packages/api/src/routers/analytics/analytics.ts`)
 
-4. **Start the server**
-   ```bash
-   cd apps/server && bun run start
-   ```
+Read-only aggregation pipelines behind the Insights view:
 
-   For the web app, serve the built static files from `apps/web/dist/`.
-
-## Development Tips
-
-### Type Checking
-```bash
-# Check all packages
-bun run check-types
-
-# Check specific package
-cd apps/web && bunx tsc --noEmit
-cd packages/api && bunx tsc --noEmit
-```
-
-### Database Studio
-```bash
-bun run db:studio
-```
-Opens a web UI at http://localhost:4983 to browse and edit your database.
-
-### Adding New API Routes
-
-1. Create or modify routers in `packages/api/src/routers/`
-2. Export from `packages/api/src/routers/index.ts`
-3. Use in frontend via `trpc.routerName.procedureName.useQuery()` or `.useMutation()`
+| Procedure | Pipeline highlights |
+|-----------|---------------------|
+| `analytics.dedupReport` | `$facet` — system-wide logical vs physical bytes, saved %, dedup ratio, most-duplicated blobs |
+| `analytics.storageByType` | `$lookup` + `$group` by content type for the current user |
+| `analytics.uploadActivity` | `$group` over `$dateToString` — files and bytes per day |
+| `analytics.topShared` | Two `$lookup`s + `$sort` — most-downloaded public files |
+| `analytics.folderTree` | Two `$graphLookup`s — folder depth and subtree size |
+| `analytics.topUsers` | `$group` + `$lookup` — storage leaderboard with distinct-blob counts |
 
 ---
 
-Built with [Better-T-Stack](https://github.com/AmanVarshney01/create-better-t-stack)
+Built with [Better-T-Stack](https://github.com/AmanVarshney01/create-better-t-stack).

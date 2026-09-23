@@ -28,7 +28,7 @@ function HomePage() {
             <div className="bg-primary text-primary-foreground flex size-8 items-center justify-center rounded-md">
               <HardDrive className="size-4" />
             </div>
-            VinnoDrive
+            NexDrive
           </Link>
           <nav className="flex items-center gap-4">
             {session ? (
@@ -57,7 +57,7 @@ function HomePage() {
             <span className="text-primary">smart deduplication</span>
           </h1>
           <p className="mx-auto mt-6 max-w-2xl text-lg text-muted-foreground">
-            VinnoDrive automatically detects duplicate files and saves you storage space. 
+            NexDrive automatically detects duplicate files and saves you storage space. 
             Upload, organize, and share your files securely.
           </p>
           <div className="mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row">
@@ -88,7 +88,7 @@ function HomePage() {
         <section className="border-t bg-muted/40 py-24">
           <div className="container mx-auto px-4">
             <h2 className="mb-12 text-center text-3xl font-bold">
-              Why VinnoDrive?
+              Why NexDrive?
             </h2>
             <div className="mx-auto grid max-w-5xl gap-8 sm:grid-cols-2 lg:grid-cols-4">
               <Feature
@@ -139,7 +139,7 @@ function HomePage() {
         <div className="container mx-auto px-4 text-center text-sm text-muted-foreground">
           <div className="flex items-center justify-center gap-2">
             <HardDrive className="size-4" />
-            <span>VinnoDrive</span>
+            <span>NexDrive</span>
           </div>
         </div>
       </footer>

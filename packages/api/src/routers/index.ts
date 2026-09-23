@@ -1,4 +1,5 @@
 import { protectedProcedure, publicProcedure, router } from "../index";
+import { analyticsRouter } from "./analytics";
 import { storageRouter } from "./storage";
 
 export const appRouter = router({
@@ -12,5 +13,6 @@ export const appRouter = router({
     };
   }),
   storage: storageRouter,
+  analytics: analyticsRouter,
 });
 export type AppRouter = typeof appRouter;

@@ -98,7 +98,7 @@ export function LoginForm({
                 <div className="bg-primary text-primary-foreground flex size-8 items-center justify-center rounded-md">
                   <HardDrive className="size-4" />
                 </div>
-                VinnoDrive
+                NexDrive
               </Link>
             </div>
             <CardTitle className="text-xl">Create an account</CardTitle>
@@ -216,12 +216,12 @@ export function LoginForm({
               <div className="bg-primary text-primary-foreground flex size-8 items-center justify-center rounded-md">
                 <HardDrive className="size-4" />
               </div>
-              VinnoDrive
+              NexDrive
             </Link>
           </div>
           <CardTitle className="text-xl">Welcome back</CardTitle>
           <CardDescription>
-            Sign in to your VinnoDrive account
+            Sign in to your NexDrive account
           </CardDescription>
         </CardHeader>
         <CardContent>

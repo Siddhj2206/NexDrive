@@ -88,7 +88,7 @@ function SharePage() {
           </div>
           <CardTitle className="break-all">{file.name}</CardTitle>
           <CardDescription>
-            Shared via VinnoDrive
+            Shared via NexDrive
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">

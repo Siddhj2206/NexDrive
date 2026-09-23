@@ -1,6 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import type { TRPCOptionsProxy } from "@trpc/tanstack-react-query";
-import type { AppRouter } from "@Vinnodrive/api/routers/index";
+import type { AppRouter } from "@nexdrive/api/routers/index";
 
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import {
@@ -32,7 +32,7 @@ export const Route = createRootRouteWithContext<RouterAppContext>()({
         content: "width=device-width, initial-scale=1",
       },
       {
-        title: "VinnoDrive",
+        title: "NexDrive",
       },
     ],
     links: [
@@ -53,7 +53,7 @@ function RootDocument() {
         <HeadContent />
       </head>
       <body className="bg-background text-foreground">
-        <ThemeProvider defaultTheme="system" storageKey="vinnodrive-theme">
+        <ThemeProvider defaultTheme="system" storageKey="nexdrive-theme">
           <Outlet />
           <Toaster richColors />
         </ThemeProvider>

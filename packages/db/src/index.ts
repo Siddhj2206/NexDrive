@@ -1,10 +1,26 @@
-import { drizzle } from "drizzle-orm/node-postgres";
+/**
+ * @nexdrive/db — the NexDrive MongoDB data layer.
+ *
+ * Exposes the shared connection, the Mongoose models for the five domain
+ * collections (plus the `user` view that carries the embedded quota), the quota
+ * helpers, the index builder, and the transaction wrapper.
+ */
+export {
+  connectDB,
+  getClient,
+  getDb,
+  mongoose,
+  withTransaction,
+} from "./connection";
 
-import * as schema from "./schema";
+export * from "./constants";
+export * from "./objectid";
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) {
-  throw new Error("DATABASE_URL environment variable is required");
-}
+export * from "./models";
+export {
+  adjustStorageUsed,
+  ensureQuota,
+  getQuota,
+} from "./quota";
 
-export const db = drizzle(databaseUrl, { schema });
+export { ensureIndexes } from "./indexes";

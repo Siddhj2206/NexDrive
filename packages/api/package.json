@@ -1,5 +1,5 @@
 {
-  "name": "@Vinnodrive/api",
+  "name": "@nexdrive/api",
   "type": "module",
   "exports": {
     ".": {
@@ -9,20 +9,20 @@
       "default": "./src/*.ts"
     }
   },
-  "scripts": {},
+  "scripts": {
+    "check-types": "tsc -b"
+  },
   "devDependencies": {
     "typescript": "catalog:",
-    "@Vinnodrive/config": "workspace:*"
+    "@nexdrive/config": "workspace:*"
   },
   "dependencies": {
     "@trpc/server": "catalog:",
     "@trpc/client": "catalog:",
     "hono": "catalog:",
-    "drizzle-orm": "catalog:",
-    "@types/pg": "catalog:",
     "dotenv": "catalog:",
     "zod": "catalog:",
-    "@Vinnodrive/auth": "workspace:*",
-    "@Vinnodrive/db": "workspace:*"
+    "@nexdrive/auth": "workspace:*",
+    "@nexdrive/db": "workspace:*"
   }
 }

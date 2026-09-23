@@ -1,5 +1,5 @@
 {
-  "name": "@Vinnodrive/db",
+  "name": "@nexdrive/db",
   "type": "module",
   "exports": {
     ".": {
@@ -10,21 +10,17 @@
     }
   },
   "scripts": {
-    "db:push": "drizzle-kit push",
-    "db:generate": "drizzle-kit generate",
-    "db:studio": "drizzle-kit studio",
-    "db:migrate": "drizzle-kit migrate"
+    "check-types": "tsc -b",
+    "db:seed": "bun run src/seed.ts"
   },
   "devDependencies": {
-    "drizzle-kit": "^0.31.8",
-    "@types/pg": "catalog:",
-    "typescript": "catalog:",
-    "@Vinnodrive/config": "workspace:*"
+    "@nexdrive/config": "workspace:*",
+    "@types/bun": "catalog:",
+    "typescript": "catalog:"
   },
   "dependencies": {
-    "drizzle-orm": "catalog:",
-    "pg": "^8.16.3",
     "dotenv": "catalog:",
-    "zod": "catalog:"
+    "mongodb": "catalog:",
+    "mongoose": "catalog:"
   }
 }

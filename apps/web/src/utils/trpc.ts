@@ -1,4 +1,4 @@
-import type { AppRouter } from "@Vinnodrive/api/routers/index";
+import type { AppRouter } from "@nexdrive/api/routers/index";
 
 import { createTRPCContext } from "@trpc/tanstack-react-query";
 
